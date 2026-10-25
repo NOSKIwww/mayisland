@@ -1,0 +1,550 @@
+name: Build MayIsland
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tweak files
+        run: |
+          cat > Tweak.m <<'MAYEOF'
+          // MayIsland - customizable glow / ring / rainbow / battery skin around the Dynamic Island.
+          // A click-through window inside SpringBoard; no private APIs.
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #include <math.h>
+
+          #define kDomain CFSTR("local.mayisland")
+
+          @interface MIWindow : UIWindow
+          @end
+          @implementation MIWindow
+          - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e { return nil; }
+          - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { return NO; }
+          @end
+
+          static MIWindow *gWin;
+          static UIView *gHost;
+          static UILabel *gToast;
+          static NSDictionary *gP;
+          static NSTimer *gTimer;
+          static int gTick = 0;
+
+          #pragma mark - Preferences
+
+          static NSString *ps(NSString *k, NSString *d) { id v = gP[k]; return [v isKindOfClass:NSString.class] ? v : d; }
+          static BOOL pb(NSString *k, BOOL d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v boolValue] : d; }
+          static double pd(NSString *k, double d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : d; }
+
+          static void loadPrefs(void) {
+              CFPreferencesAppSynchronize(kDomain);
+              NSMutableDictionary *m = [NSMutableDictionary dictionary];
+              CFArrayRef keys = CFPreferencesCopyKeyList(kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+              if (keys) {
+                  CFDictionaryRef d = CFPreferencesCopyMultiple(keys, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                  if (d) [m addEntriesFromDictionary:(__bridge_transfer NSDictionary *)d];
+                  CFRelease(keys);
+              }
+              NSDictionary *file = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/local.mayisland.plist"];
+              if ([file isKindOfClass:NSDictionary.class])
+                  for (id k in file) if (!m[k]) m[k] = file[k];
+              gP = m;
+          }
+
+          #pragma mark - Colors
+
+          static UIColor *parseHex(NSString *h, UIColor *fallback) {
+              h = [[h stringByReplacingOccurrencesOfString:@"#" withString:@""] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+              if (h.length != 6) return fallback;
+              unsigned v = 0;
+              if (![[NSScanner scannerWithString:h] scanHexInt:&v]) return fallback;
+              return [UIColor colorWithRed:((v >> 16) & 255) / 255.0 green:((v >> 8) & 255) / 255.0 blue:(v & 255) / 255.0 alpha:1];
+          }
+
+          static void themeColors(UIColor **c1, UIColor **c2) {
+              NSString *t = ps(@"theme", @"neon");
+              NSDictionary *tbl = @{
+                  @"neon":   @[@"00E5FF", @"7C4DFF"], @"sunset": @[@"FF8A00", @"FF2D95"],
+                  @"aurora": @[@"00FF9D", @"9D4DFF"], @"lava":   @[@"FF1744", @"FFC400"],
+                  @"mint":   @[@"00E676", @"00B8D4"], @"sakura": @[@"FF80AB", @"FFFFFF"],
+                  @"gold":   @[@"FFD600", @"FF9100"], @"white":  @[@"FFFFFF", @"BBBBBB"] };
+              NSArray *p = tbl[t];
+              if (p) { *c1 = parseHex(p[0], UIColor.cyanColor); *c2 = parseHex(p[1], UIColor.purpleColor); }
+              else {
+                  *c1 = parseHex(ps(@"color1", @"00E5FF"), UIColor.cyanColor);
+                  *c2 = parseHex(ps(@"color2", @"7C4DFF"), UIColor.purpleColor);
+              }
+          }
+
+          #pragma mark - Drawing
+
+          static CAShapeLayer *ringLayer(UIBezierPath *path, CGFloat width, UIColor *color) {
+              CAShapeLayer *l = [CAShapeLayer layer];
+              l.path = path.CGPath;
+              l.fillColor = nil;
+              l.strokeColor = color.CGColor;
+              l.lineWidth = width;
+              return l;
+          }
+
+          static void addPulse(CALayer *l, double speed) {
+              CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
+              a.fromValue = @0.30;
+              a.toValue = @1.0;
+              a.duration = 1.2 / MAX(speed, 0.1);
+              a.autoreverses = YES;
+              a.repeatCount = HUGE_VALF;
+              a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+              [l addAnimation:a forKey:@"mi_pulse"];
+          }
+
+          static void rebuild(void) {
+              if (!gWin) return;
+              for (CALayer *s in [gHost.layer.sublayers copy]) [s removeFromSuperlayer];
+
+              BOOL land = UIDeviceOrientationIsLandscape(UIDevice.currentDevice.orientation);
+              BOOL on = pb(@"enabled", YES) && !land;
+              gWin.hidden = !on;
+              if (!on) return;
+
+              CGFloat W = UIScreen.mainScreen.bounds.size.width;
+              CGFloat pw = (CGFloat)pd(@"width", 126), ph = (CGFloat)pd(@"height", 37), py = (CGFloat)pd(@"yOffset", 11);
+              CGFloat pad = (CGFloat)pd(@"padding", 3), th = (CGFloat)pd(@"thickness", 3);
+              double speed = pd(@"speed", 1.0);
+              CGFloat glow = (CGFloat)pd(@"glow", 10);
+              CGFloat alpha = (CGFloat)pd(@"opacity", 1.0);
+              gHost.alpha = alpha;
+
+              CGRect pill = CGRectMake((W - pw) / 2.0, py, pw, ph);
+              CGRect ring = CGRectInset(pill, -(pad + th / 2.0), -(pad + th / 2.0));
+              UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:ring cornerRadius:ring.size.height / 2.0];
+
+              UIColor *c1 = nil, *c2 = nil;
+              themeColors(&c1, &c2);
+
+              UIDevice *dev = UIDevice.currentDevice;
+              dev.batteryMonitoringEnabled = YES;
+              float level = dev.batteryLevel;
+              BOOL charging = dev.batteryState == UIDeviceBatteryStateCharging;
+              BOOL low = level >= 0 && level <= 0.20f && !charging;
+              if (low && pb(@"lowRed", YES)) { c1 = UIColor.systemRedColor; c2 = UIColor.systemOrangeColor; }
+              if (charging && pb(@"chargePulse", YES)) { c1 = UIColor.systemGreenColor; c2 = [UIColor colorWithRed:0.0 green:0.8 blue:0.7 alpha:1.0]; }
+
+              // optional fill (tints the island itself - may cover live-activity content)
+              CGFloat fa = (CGFloat)pd(@"fillAlpha", 0);
+              if (fa > 0.01) {
+                  CAShapeLayer *f = [CAShapeLayer layer];
+                  f.path = [UIBezierPath bezierPathWithRoundedRect:pill cornerRadius:ph / 2.0].CGPath;
+                  f.fillColor = [c1 colorWithAlphaComponent:fa].CGColor;
+                  [gHost.layer addSublayer:f];
+              }
+
+              NSString *style = ps(@"style", @"glow");
+              BOOL pulse = [style isEqualToString:@"pulse"] || (charging && pb(@"chargePulse", YES));
+
+              if ([style isEqualToString:@"gradient"] || [style isEqualToString:@"rainbow"]) {
+                  CALayer *box = [CALayer layer];
+                  box.frame = gHost.bounds;
+                  box.mask = ringLayer(path, th, UIColor.whiteColor);
+                  CAGradientLayer *g = [CAGradientLayer layer];
+                  if ([style isEqualToString:@"rainbow"]) {
+                      CGFloat S = MAX(ring.size.width, ring.size.height) * 2.2;
+                      g.frame = CGRectMake(CGRectGetMidX(ring) - S / 2, CGRectGetMidY(ring) - S / 2, S, S);
+                      g.type = kCAGradientLayerConic;
+                      g.startPoint = CGPointMake(0.5, 0.5);
+                      g.endPoint = CGPointMake(0.5, 0.0);
+                      NSMutableArray *cols = [NSMutableArray array];
+                      for (int i = 0; i <= 12; i++) [cols addObject:(id)[UIColor colorWithHue:(i % 12) / 12.0 saturation:0.9 brightness:1 alpha:1].CGColor];
+                      g.colors = cols;
+                      CABasicAnimation *rot = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+                      rot.fromValue = @0;
+                      rot.toValue = @(2 * M_PI);
+                      rot.duration = 4.0 / MAX(speed, 0.1);
+                      rot.repeatCount = HUGE_VALF;
+                      [g addAnimation:rot forKey:@"mi_rot"];
+                  } else {
+                      g.frame = CGRectInset(ring, -th * 2, -th * 2);
+                      g.colors = @[(id)c1.CGColor, (id)c2.CGColor];
+                      g.startPoint = CGPointMake(0, 0.5);
+                      g.endPoint = CGPointMake(1, 0.5);
+                  }
+                  [box addSublayer:g];
+                  if (glow > 0) {
+                      CAShapeLayer *gl = ringLayer(path, th, c1);
+                      gl.shadowColor = c1.CGColor; gl.shadowRadius = glow / 2.0; gl.shadowOpacity = 0.6; gl.shadowOffset = CGSizeZero;
+                      gl.opacity = 0.35;
+                      [gHost.layer addSublayer:gl];
+                  }
+                  [gHost.layer addSublayer:box];
+                  if (pulse) addPulse(box, speed);
+              } else if ([style isEqualToString:@"battery"]) {
+                  CAShapeLayer *track = ringLayer(path, th, [c1 colorWithAlphaComponent:0.25]);
+                  [gHost.layer addSublayer:track];
+                  CAShapeLayer *prog = ringLayer(path, th, c1);
+                  prog.lineCap = kCALineCapRound;
+                  prog.strokeEnd = level < 0 ? 1.0 : level;
+                  if (glow > 0) { prog.shadowColor = c1.CGColor; prog.shadowRadius = glow / 2.0; prog.shadowOpacity = 0.8; prog.shadowOffset = CGSizeZero; }
+                  [gHost.layer addSublayer:prog];
+                  if (charging) addPulse(prog, speed);
+              } else {
+                  CAShapeLayer *l = ringLayer(path, th, c1);
+                  if (![style isEqualToString:@"solid"] && glow > 0) {
+                      l.shadowColor = c1.CGColor; l.shadowRadius = glow; l.shadowOpacity = 1.0; l.shadowOffset = CGSizeZero;
+                  }
+                  [gHost.layer addSublayer:l];
+                  if (pulse) addPulse(l, speed);
+              }
+          }
+
+          static void toast(NSString *t) {
+              if (!gWin) return;
+              if (!gToast) {
+                  gToast = [UILabel new];
+                  gToast.font = [UIFont boldSystemFontOfSize:12];
+                  gToast.textColor = UIColor.whiteColor;
+                  gToast.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+                  gToast.textAlignment = NSTextAlignmentCenter;
+                  gToast.layer.cornerRadius = 8;
+                  gToast.layer.masksToBounds = YES;
+                  [gWin.rootViewController.view addSubview:gToast];
+              }
+              [gToast.layer removeAllAnimations];
+              gToast.text = t;
+              CGSize sz = [gToast sizeThatFits:CGSizeMake(320, 40)];
+              CGFloat w = sz.width + 20;
+              gToast.frame = CGRectMake((UIScreen.mainScreen.bounds.size.width - w) / 2, 70, w, 26);
+              gToast.alpha = 1;
+              [UIView animateWithDuration:0.4 delay:3 options:0 animations:^{ gToast.alpha = 0; } completion:nil];
+          }
+
+          static void applyPrefs(BOOL announce) {
+              loadPrefs();
+              rebuild();
+              if (announce) toast([NSString stringWithFormat:@"MayIsland: settings updated (%lu)", (unsigned long)gP.count]);
+          }
+
+          static void onReload(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef u) {
+              dispatch_async(dispatch_get_main_queue(), ^{ applyPrefs(YES); });
+          }
+
+          #pragma mark - Setup
+
+          static void setup(void) {
+              UIWindowScene *scene = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
+              }
+              gWin = scene ? [[MIWindow alloc] initWithWindowScene:scene] : [[MIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              gWin.frame = UIScreen.mainScreen.bounds;
+              gWin.windowLevel = 100001;
+              gWin.backgroundColor = UIColor.clearColor;
+              gWin.userInteractionEnabled = NO;
+              UIViewController *vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.clearColor;
+              vc.view.userInteractionEnabled = NO;
+              gWin.rootViewController = vc;
+              gHost = [[UIView alloc] initWithFrame:vc.view.bounds];
+              gHost.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              gHost.userInteractionEnabled = NO;
+              [vc.view addSubview:gHost];
+              gWin.hidden = NO;
+
+              UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+              [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
+              NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+              void (^re)(NSNotification *) = ^(NSNotification *n) { rebuild(); };
+              [nc addObserverForName:UIDeviceBatteryLevelDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:re];
+              [nc addObserverForName:UIDeviceBatteryStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:re];
+              [nc addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:re];
+
+              CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, onReload,
+                  CFSTR("local.mayisland.reload"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+              applyPrefs(NO);
+              toast([NSString stringWithFormat:@"MayIsland 0.1.0 · %lu settings loaded", (unsigned long)gP.count]);
+
+              gTimer = [NSTimer timerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *t) { applyPrefs(NO); }];
+              [NSRunLoop.mainRunLoop addTimer:gTimer forMode:NSRunLoopCommonModes];
+              NSLog(@"[MayIsland] ready (scene: %@)", scene ? @"yes" : @"no");
+          }
+
+          __attribute__((constructor))
+          static void mayisland_init(void) {
+              if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
+              NSLog(@"[MayIsland] loaded in SpringBoard");
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
+          }
+          MAYEOF
+          cat > PrefsController.m <<'MAYEOF'
+          // MayIsland settings: one controller that shows any pane (Root, Set1.., Set1W1..) in English or Russian.
+          #import <UIKit/UIKit.h>
+
+          @interface PSSpecifier : NSObject
+          - (id)propertyForKey:(NSString *)key;
+          @end
+
+          @interface PSViewController : UIViewController
+          @property (nonatomic, retain) PSSpecifier *specifier;
+          @end
+
+          @interface PSListController : PSViewController
+          - (NSArray *)loadSpecifiersFromPlistName:(NSString *)name target:(id)target;
+          - (void)reloadSpecifiers;
+          - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier;
+          @end
+
+          #define kDomain CFSTR("local.mayisland")
+
+          static NSString *currentLang(void) {
+              CFPreferencesAppSynchronize(kDomain);
+              CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("language"), kDomain);
+              NSString *r = @"en";
+              if (v) {
+                  if (CFGetTypeID(v) == CFStringGetTypeID() && [(__bridge NSString *)v isEqualToString:@"ru"]) r = @"ru";
+                  CFRelease(v);
+              }
+              return r;
+          }
+
+          @interface MIPaneController : PSListController
+          @property (nonatomic, copy) NSString *loadedLang;
+          @end
+
+          @implementation MIPaneController
+
+          - (NSString *)paneName {
+              NSString *n = nil;
+              @try { n = [self.specifier propertyForKey:@"mhplist"]; } @catch (__unused id e) {}
+              return ([n isKindOfClass:NSString.class] && n.length) ? n : @"Root";
+          }
+
+          - (NSArray *)specifiers {
+              NSArray *s = nil;
+              @try { s = [self valueForKey:@"_specifiers"]; } @catch (__unused id e) {}
+              if (!s) {
+                  NSString *lang = currentLang();
+                  s = [self loadSpecifiersFromPlistName:[NSString stringWithFormat:@"%@_%@", [self paneName], lang] target:self];
+                  @try { [self setValue:s forKey:@"_specifiers"]; } @catch (__unused id e) {}
+                  self.loadedLang = lang;
+              }
+              return s;
+          }
+
+          - (void)refreshIfLangChanged {
+              if (self.loadedLang && ![self.loadedLang isEqualToString:currentLang()]) {
+                  @try { [self setValue:nil forKey:@"_specifiers"]; } @catch (__unused id e) {}
+                  [self reloadSpecifiers];
+              }
+          }
+
+          - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
+              [super setPreferenceValue:value specifier:specifier];
+              [self refreshIfLangChanged];
+          }
+
+          - (void)viewWillAppear:(BOOL)animated {
+              [super viewWillAppear:animated];
+              [self refreshIfLangChanged];
+          }
+
+          - (void)resetData {
+              CFArrayRef keys = CFPreferencesCopyKeyList(kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+              if (keys) {
+                  NSMutableArray *del = [NSMutableArray array];
+                  for (NSString *k in (__bridge NSArray *)keys) if (![k isEqualToString:@"language"]) [del addObject:k];
+                  CFPreferencesSetMultiple(NULL, (__bridge CFArrayRef)del, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+                  CFRelease(keys);
+              }
+              CFPreferencesAppSynchronize(kDomain);
+              CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("local.mayisland.reload"), NULL, NULL, true);
+              @try { [self setValue:nil forKey:@"_specifiers"]; } @catch (__unused id e) {}
+              [self reloadSpecifiers];
+          }
+
+          @end
+          MAYEOF
+          cat > gen_prefs.py <<'MAYEOF'
+          # Generates the MayIsland settings pane (English + Russian), the Settings icon and bundle files into ./bundle
+          import plistlib, os, zlib, struct, math
+          D = 'local.mayisland'; N = 'local.mayisland.reload'
+          RU = {
+           'Language':'Язык','Default language is English.':'По умолчанию английский.','MayIsland':'MayIsland','Enable MayIsland':'Включить MayIsland',
+           'Design':'Дизайн','Theme':'Тема','Style':'Стиль','Custom':'Свои цвета','Neon':'Неон','Sunset':'Закат','Aurora':'Аврора','Lava':'Лава','Mint':'Мята','Sakura':'Сакура','Gold':'Золото','White':'Белый',
+           'Solid ring':'Кольцо','Glow':'Свечение','Gradient':'Градиент','Rainbow (animated)':'Радуга (анимация)','Pulse':'Пульсация','Battery ring':'Кольцо заряда',
+           'Custom colors':'Свои цвета','Color 1 (hex RRGGBB)':'Цвет 1 (hex RRGGBB)','Color 2 (hex RRGGBB)':'Цвет 2 (hex RRGGBB)','Used only when Theme is Custom.':'Работают, только если тема «Свои цвета».',
+           'Shape':'Форма','Island width':'Ширина острова','Island height':'Высота острова','Island top offset':'Отступ острова сверху','Gap around island':'Зазор вокруг острова','Line thickness':'Толщина линии',
+           'Match these to your iPhone if the ring does not hug the island (14/15/16 Pro: 126 x 37, offset 11).':'Подгони под свой iPhone, если кольцо не облегает остров (14/15/16 Pro: 126 x 37, отступ 11).',
+           'Effects':'Эффекты','Glow radius':'Радиус свечения','Animation speed':'Скорость анимации','Island tint (fill)':'Заливка острова','Opacity':'Прозрачность',
+           'Fill tints the island itself and may cover live activities. Keep at 0 to leave the island untouched.':'Заливка закрашивает сам остров и может перекрывать live-активности. Оставь 0, чтобы не трогать остров.',
+           'Battery':'Батарея','Pulse green while charging':'Зелёная пульсация при зарядке','Turn red at low battery (20%)':'Красный при низком заряде (20%)',
+           'Reset':'Сброс','Reset Data':'Сбросить данные','Resets every MayIsland setting except language.':'Сбрасывает все настройки MayIsland, кроме языка.',
+           'Credits':'Авторы','MayIsland draws a skin around the Dynamic Island. It does not change live-activity content.':'MayIsland рисует «скин» вокруг Dynamic Island. Содержимое live-активностей он не меняет.',
+          }
+          LANG = 'en'
+          def T(s): return RU.get(s, s) if LANG == 'ru' else s
+          def pn(d): d['PostNotification'] = N; return d
+          def grp(label=None, foot=None):
+              d = {'cell': 'PSGroupCell'}
+              if label: d['label'] = T(label)
+              if foot: d['footerText'] = T(foot)
+              return d
+          def sw(key, label, default): return pn({'cell':'PSSwitchCell','label':T(label),'default':default,'defaults':D,'key':key})
+          def lst(key, label, default, opts):
+              return pn({'cell':'PSLinkListCell','label':T(label),'default':default,'defaults':D,'key':key,'detail':'PSListItemsController',
+                         'validTitles':[T(a) for a, b in opts],'validValues':[b for a, b in opts]})
+          def edt(key, label, default='', ph=''): return pn({'cell':'PSEditTextCell','label':T(label),'default':default,'defaults':D,'key':key,'placeholder':ph})
+          def sld(key, default, mn, mx): return pn({'cell':'PSSliderCell','default':float(default),'defaults':D,'key':key,'min':float(mn),'max':float(mx),'showValue':True})
+
+          THEMES = [('Neon','neon'),('Sunset','sunset'),('Aurora','aurora'),('Lava','lava'),('Mint','mint'),('Sakura','sakura'),('Gold','gold'),('White','white'),('Custom','custom')]
+          STYLES = [('Glow','glow'),('Solid ring','solid'),('Gradient','gradient'),('Rainbow (animated)','rainbow'),('Pulse','pulse'),('Battery ring','battery')]
+
+          def root(with_lang=True, fallback=False):
+              it = []
+              if with_lang:
+                  it += [grp('Language','Default language is English.'),
+                         {'cell':'PSLinkListCell','label':T('Language'),'default':'en','defaults':D,'key':'language','detail':'PSListItemsController','validTitles':['English','Русский'],'validValues':['en','ru']}]
+              it += [grp('MayIsland'), sw('enabled','Enable MayIsland',True),
+                     grp('Design'), lst('theme','Theme','neon',THEMES), lst('style','Style','glow',STYLES),
+                     grp('Custom colors','Used only when Theme is Custom.'),
+                     edt('color1','Color 1 (hex RRGGBB)','00E5FF','00E5FF'), edt('color2','Color 2 (hex RRGGBB)','7C4DFF','7C4DFF'),
+                     grp('Island width','Match these to your iPhone if the ring does not hug the island (14/15/16 Pro: 126 x 37, offset 11).'), sld('width',126,80,220),
+                     grp('Island height'), sld('height',37,20,60),
+                     grp('Island top offset'), sld('yOffset',11,0,40),
+                     grp('Gap around island'), sld('padding',3,0,14),
+                     grp('Line thickness'), sld('thickness',3,1,10),
+                     grp('Glow radius'), sld('glow',10,0,30),
+                     grp('Animation speed'), sld('speed',1,0.2,5),
+                     grp('Island tint (fill)','Fill tints the island itself and may cover live activities. Keep at 0 to leave the island untouched.'), sld('fillAlpha',0,0,0.9),
+                     grp('Opacity'), sld('opacity',1,0.1,1),
+                     grp('Battery'), sw('chargePulse','Pulse green while charging',True), sw('lowRed','Turn red at low battery (20%)',True)]
+              if with_lang:
+                  it += [grp('Reset','Resets every MayIsland setting except language.'),
+                         {'cell':'PSButtonCell','label':T('Reset Data'),'action':'resetData'}]
+              it += [grp('Credits','MayIsland draws a skin around the Dynamic Island. It does not change live-activity content.')]
+              d = {'title': 'MayIsland', 'items': it}
+              if fallback: d['entry'] = {'cell':'PSLinkCell','label':'MayIsland','icon':'icon.png'}
+              return d
+
+          def icon(size=58):
+              c = size / 2.0
+              rows = []
+              for y in range(size):
+                  row = bytearray([0])
+                  for x in range(size):
+                      r, g, b = 12, 12, 18
+                      # pill
+                      px, py = x + 0.5 - c, y + 0.5 - c
+                      w, h = size * 0.62, size * 0.20
+                      dx, dy = abs(px) - (w / 2 - h / 2), abs(py)
+                      dist = math.hypot(max(dx, 0), dy) - h / 2 if dx > 0 else dy - h / 2
+                      if dist < 0:
+                          r, g, b = 0, 0, 0
+                      if abs(dist - 3.2) < 1.6:
+                          t = min(1.0, max(0.0, (px / w) + 0.5))
+                          r, g, b = int(124 * t), int(229 - 150 * t), 255
+                      row += bytes((r, g, b))
+                  rows.append(bytes(row))
+              raw = b''.join(rows)
+              ch = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+              return b'\x89PNG\r\n\x1a\n' + ch(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) + ch(b'IDAT', zlib.compress(raw, 9)) + ch(b'IEND', b'')
+
+          os.makedirs('bundle', exist_ok=True)
+          w = lambda n, d: open(os.path.join('bundle', n), 'wb').write(plistlib.dumps(d, fmt=plistlib.FMT_XML))
+          for LANG in ('en', 'ru'):
+              w('Root_%s.plist' % LANG, root())
+          LANG = 'en'
+          w('PrefsFallback.plist', root(with_lang=False, fallback=True))
+          w('Info.plist', {'CFBundleDevelopmentRegion':'en','CFBundleExecutable':'MayIslandPrefs','CFBundleIdentifier':'local.mayislandprefs','CFBundleInfoDictionaryVersion':'6.0',
+                           'CFBundleName':'MayIslandPrefs','CFBundlePackageType':'BNDL','CFBundleShortVersionString':'0.1.0','CFBundleVersion':'1','NSPrincipalClass':'MIPaneController'})
+          w('PrefsEntry.plist', {'entry':{'bundle':'MayIslandPrefs','cell':'PSLinkCell','detail':'MIPaneController','isController':True,'label':'MayIsland','icon':'icon.png'}})
+          open('bundle/icon.png', 'wb').write(icon())
+          print('generated', len(os.listdir('bundle')), 'files')
+          MAYEOF
+          cat > MayIsland.plist <<'MAYEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>Filter</key><dict><key>Bundles</key><array><string>com.apple.springboard</string></array></dict></dict></plist>
+          MAYEOF
+          cat > control <<'MAYEOF'
+          Package: local.mayisland
+          Name: MayIsland
+          Version: 0.1.0
+          Architecture: iphoneos-arm64e
+          Description: Dynamic Island skins: glow, ring, gradient, rainbow, pulse and battery ring with themes and a settings pane.
+          Maintainer: Local Build
+          Author: Local Build
+          Section: Tweaks
+          Depends: ellekit | mobilesubstrate
+          MAYEOF
+          python3 gen_prefs.py
+          ls -la bundle
+
+      - name: Install tools
+        run: brew install ldid dpkg
+
+      - name: Compile tweak (plain clang from Xcode)
+        run: |
+          set -ex
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          COMMON="-isysroot $SDK -miphoneos-version-min=14.0 -fobjc-arc -fmodules -Wno-deprecated-declarations -O2 -framework UIKit -framework Foundation"
+          TW="$COMMON -dynamiclib -framework QuartzCore -install_name /Library/MobileSubstrate/DynamicLibraries/MayIsland.dylib"
+          if xcrun --sdk iphoneos clang -arch arm64 -arch arm64e $TW Tweak.m -o MayIsland.dylib; then
+            echo "built arm64 + arm64e"
+          else
+            echo "arm64e failed, building arm64 only"
+            xcrun --sdk iphoneos clang -arch arm64 $TW Tweak.m -o MayIsland.dylib
+          fi
+          ldid -S MayIsland.dylib
+          lipo -info MayIsland.dylib
+          otool -L MayIsland.dylib
+
+      - name: Compile settings pane (optional, falls back to a simple pane)
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          PF="-isysroot $SDK -miphoneos-version-min=14.0 -fobjc-arc -Wno-deprecated-declarations -O2 -bundle -undefined dynamic_lookup -framework UIKit -framework Foundation"
+          if xcrun --sdk iphoneos clang -arch arm64 -arch arm64e $PF PrefsController.m -o MayIslandPrefs \
+             || xcrun --sdk iphoneos clang -arch arm64 $PF PrefsController.m -o MayIslandPrefs; then
+            ldid -S MayIslandPrefs && lipo -info MayIslandPrefs && touch prefs_ok
+          else
+            echo "settings pane failed to compile, using the simple pane"
+          fi
+
+      - name: Build deb (iphoneos-arm64e, rootful /Library)
+        run: |
+          set -ex
+          mkdir -p pkg/DEBIAN pkg/Library/MobileSubstrate/DynamicLibraries pkg/Library/PreferenceLoader/Preferences out
+          cp MayIsland.dylib MayIsland.plist pkg/Library/MobileSubstrate/DynamicLibraries/
+          chmod 755 pkg/Library/MobileSubstrate/DynamicLibraries/MayIsland.dylib
+          if [ -f prefs_ok ]; then
+            B=pkg/Library/PreferenceBundles/MayIslandPrefs.bundle
+            mkdir -p "$B"
+            cp MayIslandPrefs "$B/MayIslandPrefs"
+            chmod 755 "$B/MayIslandPrefs"
+            cp bundle/Info.plist bundle/Root_*.plist bundle/icon.png "$B/"
+            cp bundle/PrefsEntry.plist pkg/Library/PreferenceLoader/Preferences/MayIsland.plist
+          else
+            cp bundle/PrefsFallback.plist pkg/Library/PreferenceLoader/Preferences/MayIsland.plist
+            cp bundle/icon.png pkg/Library/PreferenceLoader/Preferences/icon.png
+          fi
+          cp control pkg/DEBIAN/control
+          echo "Installed-Size: $(du -sk pkg/Library | cut -f1)" >> pkg/DEBIAN/control
+          dpkg-deb --root-owner-group -Zlzma -b pkg out/mayisland_iphoneos-arm64e.deb || dpkg-deb --root-owner-group -Zgzip -b pkg out/mayisland_iphoneos-arm64e.deb
+          dpkg-deb -I out/mayisland_iphoneos-arm64e.deb
+          dpkg-deb -c out/mayisland_iphoneos-arm64e.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mayisland-deb
+          path: out/*.deb
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: MayIsland build ${{ github.run_number }}
+          files: out/*.deb
