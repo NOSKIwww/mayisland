@@ -34,6 +34,8 @@ jobs:
           static NSDictionary *gP;
           static NSTimer *gTimer;
           static int gTick = 0;
+          static CGRect gLastRect;
+          static NSString *gHow = @"manual";
 
           #pragma mark - Preferences
 
@@ -49,6 +51,11 @@ jobs:
                   CFDictionaryRef d = CFPreferencesCopyMultiple(keys, kDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
                   if (d) [m addEntriesFromDictionary:(__bridge_transfer NSDictionary *)d];
                   CFRelease(keys);
+              }
+              for (NSString *k in @[@"enabled", @"auto", @"theme", @"style", @"color1", @"color2", @"width", @"height", @"yOffset", @"padding",
+                                    @"thickness", @"glow", @"speed", @"fillAlpha", @"opacity", @"chargePulse", @"lowRed"]) {
+                  CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)k, kDomain);
+                  if (v) m[k] = (__bridge_transfer id)v;
               }
               NSDictionary *file = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/local.mayisland.plist"];
               if ([file isKindOfClass:NSDictionary.class])
@@ -82,6 +89,31 @@ jobs:
           }
 
           #pragma mark - Drawing
+
+          static void scanAperture(UIView *v, int depth, CGRect *best, CGFloat sw) {
+              if (depth > 12) return;
+              NSString *n = NSStringFromClass(v.class);
+              if (!v.hidden && v.alpha > 0.01 && ([n containsString:@"SystemAperture"] || [n containsString:@"DynamicIsland"])) {
+                  CGRect r = [v convertRect:v.bounds toView:nil];
+                  if (r.size.width >= 60 && r.size.width <= sw - 24 && r.size.height >= 20 && r.size.height <= 400 && r.origin.y >= 0 && r.origin.y < 120
+                      && r.size.width * r.size.height > best->size.width * best->size.height) *best = r;
+              }
+              for (UIView *s in v.subviews) scanAperture(s, depth + 1, best, sw);
+          }
+
+          static CGRect islandRect(void) {
+              CGFloat W = UIScreen.mainScreen.bounds.size.width;
+              CGRect best = CGRectZero;
+              for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                  if (w == gWin || w.hidden) continue;
+                  scanAperture(w, 0, &best, W);
+              }
+              if (best.size.width > 0) { gHow = @"auto"; return best; }
+              gHow = @"table";
+              BOOL big = (W >= 402 && W != 430);
+              CGFloat iw = big ? 125 : 126;
+              return CGRectMake((W - iw) / 2.0, big ? 14 : 11, iw, 37);
+          }
 
           static CAShapeLayer *ringLayer(UIBezierPath *path, CGFloat width, UIColor *color) {
               CAShapeLayer *l = [CAShapeLayer layer];
@@ -120,7 +152,11 @@ jobs:
               CGFloat alpha = (CGFloat)pd(@"opacity", 1.0);
               gHost.alpha = alpha;
 
-              CGRect pill = CGRectMake((W - pw) / 2.0, py, pw, ph);
+              CGRect pill;
+              if (pb(@"auto", YES)) pill = islandRect();
+              else { gHow = @"manual"; pill = CGRectMake((W - pw) / 2.0, py, pw, ph); }
+              gLastRect = pill;
+              ph = pill.size.height;
               CGRect ring = CGRectInset(pill, -(pad + th / 2.0), -(pad + th / 2.0));
               UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:ring cornerRadius:ring.size.height / 2.0];
 
@@ -225,7 +261,7 @@ jobs:
           static void applyPrefs(BOOL announce) {
               loadPrefs();
               rebuild();
-              if (announce) toast([NSString stringWithFormat:@"MayIsland: settings updated (%lu)", (unsigned long)gP.count]);
+              if (announce) toast([NSString stringWithFormat:@"MayIsland: updated (%lu) · %@ %dx%d", (unsigned long)gP.count, gHow, (int)gLastRect.size.width, (int)gLastRect.size.height]);
           }
 
           static void onReload(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef u) {
@@ -266,9 +302,21 @@ jobs:
                   CFSTR("local.mayisland.reload"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
               applyPrefs(NO);
-              toast([NSString stringWithFormat:@"MayIsland 0.1.0 · %lu settings loaded", (unsigned long)gP.count]);
+              toast([NSString stringWithFormat:@"MayIsland 0.2.0 · %lu settings · %@ %dx%d", (unsigned long)gP.count, gHow, (int)gLastRect.size.width, (int)gLastRect.size.height]);
 
-              gTimer = [NSTimer timerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *t) { applyPrefs(NO); }];
+              gTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+                  gTick++;
+                  if (gTick % 4 == 0) {
+                      NSDictionary *old = gP;
+                      loadPrefs();
+                      if (![old isEqualToDictionary:gP]) { rebuild(); return; }
+                  }
+                  if (gWin && !gWin.hidden && pb(@"auto", YES)) {
+                      CGRect r = islandRect();
+                      if (fabs(r.origin.x - gLastRect.origin.x) > 0.5 || fabs(r.origin.y - gLastRect.origin.y) > 0.5
+                          || fabs(r.size.width - gLastRect.size.width) > 0.5 || fabs(r.size.height - gLastRect.size.height) > 0.5) rebuild();
+                  }
+              }];
               [NSRunLoop.mainRunLoop addTimer:gTimer forMode:NSRunLoopCommonModes];
               NSLog(@"[MayIsland] ready (scene: %@)", scene ? @"yes" : @"no");
           }
@@ -382,7 +430,7 @@ jobs:
            'Effects':'Эффекты','Glow radius':'Радиус свечения','Animation speed':'Скорость анимации','Island tint (fill)':'Заливка острова','Opacity':'Прозрачность',
            'Fill tints the island itself and may cover live activities. Keep at 0 to leave the island untouched.':'Заливка закрашивает сам остров и может перекрывать live-активности. Оставь 0, чтобы не трогать остров.',
            'Battery':'Батарея','Pulse green while charging':'Зелёная пульсация при зарядке','Turn red at low battery (20%)':'Красный при низком заряде (20%)',
-           'Reset':'Сброс','Reset Data':'Сбросить данные','Resets every MayIsland setting except language.':'Сбрасывает все настройки MayIsland, кроме языка.',
+           'Reset':'Сброс','Auto-detect island':'Авто-определение острова','Finds the island and follows its size automatically. Turn off to use the manual values below.':'Находит остров и сам подстраивается под его размер. Выключи, чтобы использовать значения ниже вручную.','Manual values (used only when auto-detect is off).':'Ручные значения (работают, только если авто-определение выключено).','Reset Data':'Сбросить данные','Resets every MayIsland setting except language.':'Сбрасывает все настройки MayIsland, кроме языка.',
            'Credits':'Авторы','MayIsland draws a skin around the Dynamic Island. It does not change live-activity content.':'MayIsland рисует «скин» вокруг Dynamic Island. Содержимое live-активностей он не меняет.',
           }
           LANG = 'en'
@@ -412,7 +460,8 @@ jobs:
                      grp('Design'), lst('theme','Theme','neon',THEMES), lst('style','Style','glow',STYLES),
                      grp('Custom colors','Used only when Theme is Custom.'),
                      edt('color1','Color 1 (hex RRGGBB)','00E5FF','00E5FF'), edt('color2','Color 2 (hex RRGGBB)','7C4DFF','7C4DFF'),
-                     grp('Island width','Match these to your iPhone if the ring does not hug the island (14/15/16 Pro: 126 x 37, offset 11).'), sld('width',126,80,220),
+                     grp('Auto-detect island','Finds the island and follows its size automatically. Turn off to use the manual values below.'), sw('auto','Auto-detect island',True),
+                     grp('Island width','Manual values (used only when auto-detect is off).'), sld('width',126,80,220),
                      grp('Island height'), sld('height',37,20,60),
                      grp('Island top offset'), sld('yOffset',11,0,40),
                      grp('Gap around island'), sld('padding',3,0,14),
@@ -473,7 +522,7 @@ jobs:
           cat > control <<'MAYEOF'
           Package: local.mayisland
           Name: MayIsland
-          Version: 0.1.0
+          Version: 0.2.0
           Architecture: iphoneos-arm64e
           Description: Dynamic Island skins: glow, ring, gradient, rainbow, pulse and battery ring with themes and a settings pane.
           Maintainer: Local Build
